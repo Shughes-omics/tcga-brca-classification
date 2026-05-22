@@ -1,0 +1,307 @@
+---
+title: "Homework 5"
+author: "Shawn Hughes"
+date: "2026-02-16"
+output: html_document
+---
+
+# Dataset and Outcome
+
+For this analysis, RNA-seq gene expression data were obtained from the TCGA-BRCA course project using the TCGAbiolinks package. To satisfy the classification requirements specified in the assignment, the dataset was restricted to two sample classes: primary tumor (TP) and solid tissue normal (NT). The dataset was intentionally balanced by selecting 113 TP and 113 NT samples, resulting in a total sample size of N = 226. This configuration satisfies the stated requirements of having more than 100 samples, a binary outcome variable, and a relatively even split between classes. The outcome variable used throughout the analysis was tissue class, defined as TP versus NT.
+
+# Normalization 
+
+Prior to model development, exploratory analyses were performed to assess basic properties of the RNA-seq count data. Examination of library sizes and sample distributions revealed variability consistent with differences in sequencing depth and composition, which is characteristic of raw RNA-seq counts. Because these effects can introduce technical bias and distort downstream analyses, normalization was necessary. TMM normalization was applied to correct for library size differences, followed by transformation of the data into logCPM values. This normalization approach produces expression measures that are more comparable across samples and stabilizes variance for subsequent analyses.
+
+# PCA
+
+Principal component analysis (PCA) was conducted using the TMM-normalized logCPM matrix with highly variable genes. The PCA results show clear partitioning of samples by tissue class, with TP and NT samples forming distinct clusters primarily along PC1. PC1 explains 17.1% of the variance, while PC2 explains 7.9%. The observed separation indicates that tumor versus normal differences represent a dominant source of variation in the dataset. Although the variance explained by the first components is not numerically large, this distribution is typical for high-dimensional gene expression data where variance is distributed across many features. The clustering pattern nevertheless demonstrates that global expression structure aligns with the biological outcome, supporting the suitability of the dataset for supervised classification.
+
+# Feature selection
+
+Feature selection was performed by ranking genes according to their statistical association with TP versus NT status. The two most significant genes identified were ENSG00000165197.5 and ENSG00000136158.12, with p-values of 1.55 × 10⁻⁸⁶ and 3.79 × 10⁻⁷⁷, respectively. These extremely small p-values indicate strong differential behavior between tumor and normal tissue samples and suggest that these genes capture highly informative class-specific signals.
+
+
+# Logistic Regression Model Comparison
+
+Logistic regression models were fit to predict tissue class using the most significant gene alone and then using the two most significant genes jointly. Under a single 80/20 training and testing split, both models achieved perfect classification performance, with accuracy, sensitivity, specificity, and ROC AUC values equal to 1.0. Because performance was already at ceiling with the single-gene model, inclusion of the second gene did not produce observable improvement within this evaluation. The correlation between the expression levels of the two most significant genes was then examined, yielding a Pearson correlation coefficient of r = 0.857. This strong positive correlation indicates that the two genes capture overlapping information, which provides a reasonable explanation for the minimal change in model performance when both predictors were included.
+
+# Cross Validation 
+
+To obtain a more reliable estimate of predictive performance, repeated stratified 80/20 splits were used to approximate Leave-P-out cross-validation behavior. Logistic regression and naïve Bayes classifiers were evaluated using both single-gene and correlated-gene predictor sets. Across 100 repeated splits, all models exhibited near-perfect ROC AUC values in the range of approximately 0.998 to 0.999, indicating extremely strong discriminative performance. Models incorporating correlated gene pairs demonstrated small but consistent improvements in mean accuracy and AUC relative to single-gene models. These results suggest that while a single highly significant gene captures most of the predictive signal, inclusion of an additional correlated predictor may provide modest gains in classification stability across resampling iterations.
+
+# Results
+
+The results indicate that tumor versus normal tissue differences dominate expression variability in the TCGA-BRCA dataset. PCA reveals clear class-associated structure, feature selection identifies genes with extremely strong discriminative power, and both logistic regression and naïve Bayes classifiers achieve very high predictive performance. The strong correlation observed among top predictors is consistent with the limited incremental improvement observed when combining features. These findings collectively demonstrate that the dataset contains robust biological signal suitable for supervised classification.
+
+
+```{r setup, message=FALSE, warning=FALSE}
+suppressPackageStartupMessages({
+  library(TCGAbiolinks)
+  library(SummarizedExperiment)
+  library(edgeR)
+  library(limma)
+  library(dplyr)
+  library(tibble)
+  library(ggplot2)
+  library(yardstick)
+  library(rsample)
+  library(e1071)
+  library(logistf)
+})
+
+set.seed(1)
+
+cache_dir <- file.path(getwd(), "tcga_cache")
+dir.create(cache_dir, showWarnings = FALSE)
+se_rds <- file.path(cache_dir, "tcga_brca_TP113_NT113_se.rds")
+
+
+
+if (file.exists(se_rds)) {
+  se <- readRDS(se_rds)
+} else {
+
+  q_all <- GDCquery(
+    project = "TCGA-BRCA",
+    data.category = "Transcriptome Profiling",
+    data.type = "Gene Expression Quantification",
+    workflow.type = "STAR - Counts"
+  )
+
+  case_info <- getResults(q_all)
+
+  tp <- TCGAquery_SampleTypes(barcode = case_info$cases, typesample = "TP")[1:113]
+  nt <- TCGAquery_SampleTypes(barcode = case_info$cases, typesample = "NT")[1:113]
+
+  cat("TP:", length(tp), " NT:", length(nt), "\n")
+
+  q <- GDCquery(
+    project = "TCGA-BRCA",
+    data.category = "Transcriptome Profiling",
+    data.type = "Gene Expression Quantification",
+    workflow.type = "STAR - Counts",
+    barcode = c(tp, nt)
+  )
+
+  GDCdownload(q, directory = cache_dir)
+  se <- GDCprepare(q, directory = cache_dir)
+
+  saveRDS(se, se_rds)
+}
+
+stopifnot(inherits(se, "SummarizedExperiment"))
+
+
+## 1) Pull counts and labels
+
+assay_name <- "unstranded"
+stopifnot(assay_name %in% assayNames(se))
+counts <- assay(se, assay_name)
+
+cd <- as.data.frame(colData(se))
+
+y_raw <- NULL
+if ("shortLetterCode" %in% names(cd)) {
+  y_raw <- cd$shortLetterCode
+} else if ("sample_type" %in% names(cd)) {
+  y_raw <- cd$sample_type
+} else if ("definition" %in% names(cd)) {
+  y_raw <- cd$definition
+} else {
+  stop("Couldn't find sample type info in colData(se).")
+}
+
+y <- as.character(y_raw)
+y[y %in% c("Primary Tumor","Tumor","TP","primary tumor","tumor")] <- "TP"
+y[y %in% c("Solid Tissue Normal","Normal","NT","solid tissue normal","normal")] <- "NT"
+
+keep <- y %in% c("TP","NT")
+counts <- counts[, keep, drop = FALSE]
+y <- factor(y[keep], levels = c("NT","TP"))
+
+cat("\nN samples:", length(y), "\n")
+print(table(y))
+
+
+## 2) edgeR filter and TMM
+
+dge <- DGEList(counts = counts, group = y)
+
+keep_genes <- rowSums(cpm(dge) >= 1) >= 10
+dge <- dge[keep_genes, , keep.lib.sizes = FALSE]
+
+dge <- calcNormFactors(dge, method = "TMM")
+logCPM <- cpm(dge, log = TRUE, prior.count = 1)
+
+
+## 3) PCA 
+
+gene_var <- apply(logCPM, 1, var)
+top_var <- names(sort(gene_var, decreasing = TRUE))[1:min(2000, length(gene_var))]
+
+pca <- prcomp(t(logCPM[top_var, , drop = FALSE]), center = TRUE, scale. = TRUE)
+var_expl <- (pca$sdev^2) / sum(pca$sdev^2)
+cum_var <- cumsum(var_expl)
+
+pcs_50 <- which(cum_var >= 0.50)[1]
+pcs_75 <- which(cum_var >= 0.75)[1]
+
+cat("\nPCs to reach 50% variance:", pcs_50, "\n")
+cat("PCs to reach 75% variance:", pcs_75, "\n")
+
+pca_df <- as.data.frame(pca$x[, 1:2])
+pca_df$y <- y
+
+ggplot(pca_df, aes(PC1, PC2, shape = y)) +
+  geom_point(size = 2.5, alpha = 0.85) +
+  labs(
+    title = "PCA of TMM-normalized logCPM (top variable genes)",
+    x = paste0("PC1 (", round(100 * var_expl[1], 1), "%)"),
+    y = paste0("PC2 (", round(100 * var_expl[2], 1), "%)")
+  ) +
+  theme_minimal()
+
+
+## 4) Feature selection 
+
+design <- model.matrix(~ y)
+v <- voom(dge, design = design, plot = FALSE)
+fit <- lmFit(v, design)
+fit <- eBayes(fit)
+
+tt <- topTable(fit, coef = "yTP", number = Inf, sort.by = "P") %>%
+  rownames_to_column("gene_id")
+
+top1 <- tt$gene_id[1]
+top2 <- tt$gene_id[2]
+
+cat("\nTop gene:", top1, "p=", tt$P.Value[1], "\n")
+cat("2nd gene:", top2, "p=", tt$P.Value[2], "\n")
+
+df_model <- tibble(
+  y = y,
+  g1 = as.numeric(logCPM[top1, ]),
+  g2 = as.numeric(logCPM[top2, ])
+)
+
+r12 <- cor(df_model$g1, df_model$g2, use = "pairwise.complete.obs")
+cat("\nPearson r(top1, top2) =", r12, "\n")
+
+cors <- apply(logCPM, 1, function(x) cor(x, df_model$g1, use = "pairwise.complete.obs"))
+cors[top1] <- NA
+best_cor_gene <- names(which.max(abs(cors)))
+best_cor_val <- cors[best_cor_gene]
+
+cat("Most correlated with top1:", best_cor_gene, " r =", best_cor_val, "\n")
+
+df_model$g3 <- as.numeric(logCPM[best_cor_gene, ])
+
+
+## 5) Metrics and model wrappers
+
+compute_metrics <- function(truth, prob_event, threshold = 0.5) {
+  stopifnot(is.factor(truth), all(levels(truth) == c("NT", "TP")))
+  pred_class <- factor(ifelse(prob_event >= threshold, "TP", "NT"), levels = c("NT","TP"))
+  tibble(
+    accuracy = yardstick::accuracy_vec(truth, pred_class),
+    sensitivity = yardstick::sens_vec(truth, pred_class, event_level = "second"),
+    specificity = yardstick::spec_vec(truth, pred_class, event_level = "second"),
+    roc_auc = yardstick::roc_auc_vec(truth, prob_event, event_level = "second")
+  )
+}
+
+fit_firth_logistic <- function(train_df, formula) {
+  logistf::logistf(formula, data = train_df)
+}
+predict_firth_prob <- function(model, new_df) {
+  as.numeric(predict(model, newdata = new_df, type = "response"))
+}
+
+fit_nb <- function(train_df, x_cols) {
+  e1071::naiveBayes(x = train_df[, x_cols, drop = FALSE], y = train_df$y)
+}
+predict_nb_prob <- function(model, new_df, x_cols) {
+  p <- predict(model, new_df[, x_cols, drop = FALSE], type = "raw")
+  as.numeric(p[, "TP"])
+}
+
+
+## 6) Single 80/20 split
+
+split <- initial_split(df_model, prop = 0.8, strata = y)
+train <- training(split)
+test  <- testing(split)
+
+m_log1 <- fit_firth_logistic(train, y ~ g1)
+prob_log1 <- predict_firth_prob(m_log1, test)
+met_log1 <- compute_metrics(test$y, prob_log1)
+cat("\nFirth Logistic (top1) metrics:\n"); print(met_log1)
+
+m_log12 <- fit_firth_logistic(train, y ~ g1 + g2)
+prob_log12 <- predict_firth_prob(m_log12, test)
+met_log12 <- compute_metrics(test$y, prob_log12)
+cat("\nFirth Logistic (top1+top2) metrics:\n"); print(met_log12)
+
+m_nb1 <- fit_nb(train, x_cols = c("g1"))
+prob_nb1 <- predict_nb_prob(m_nb1, test, x_cols = c("g1"))
+met_nb1 <- compute_metrics(test$y, prob_nb1)
+cat("\nNaive Bayes (top1) metrics:\n"); print(met_nb1)
+
+m_nb13 <- fit_nb(train, x_cols = c("g1","g3"))
+prob_nb13 <- predict_nb_prob(m_nb13, test, x_cols = c("g1","g3"))
+met_nb13 <- compute_metrics(test$y, prob_nb13)
+cat("\nNaive Bayes (top1 + most-correlated) metrics:\n"); print(met_nb13)
+
+
+## 7) Repeated 80/20 splits 
+
+repeats <- 100
+res <- vector("list", repeats)
+
+for (i in seq_len(repeats)) {
+  sp <- initial_split(df_model, prop = 0.8, strata = y)
+  tr <- training(sp)
+  te <- testing(sp)
+
+  ml1 <- fit_firth_logistic(tr, y ~ g1)
+  pl1 <- predict_firth_prob(ml1, te)
+  met1 <- compute_metrics(te$y, pl1) %>% mutate(model = "FirthLog_top1")
+
+  ml13 <- fit_firth_logistic(tr, y ~ g1 + g3)
+  pl13 <- predict_firth_prob(ml13, te)
+  met13 <- compute_metrics(te$y, pl13) %>% mutate(model = "FirthLog_top1_g3")
+
+  nb1 <- fit_nb(tr, x_cols = c("g1"))
+  pnb1 <- predict_nb_prob(nb1, te, x_cols = c("g1"))
+  metnb1 <- compute_metrics(te$y, pnb1) %>% mutate(model = "NB_top1")
+
+  nb13 <- fit_nb(tr, x_cols = c("g1","g3"))
+  pnb13 <- predict_nb_prob(nb13, te, x_cols = c("g1","g3"))
+  metnb13 <- compute_metrics(te$y, pnb13) %>% mutate(model = "NB_top1_g3")
+
+  res[[i]] <- bind_rows(met1, met13, metnb1, metnb13)
+}
+
+res_df <- bind_rows(res)
+
+summary_df <- res_df %>%
+  group_by(model) %>%
+  summarize(
+    accuracy_mean = mean(accuracy), accuracy_sd = sd(accuracy),
+    auc_mean = mean(roc_auc), auc_sd = sd(roc_auc),
+    sens_mean = mean(sensitivity),
+    spec_mean = mean(specificity),
+    .groups = "drop"
+  )
+
+cat("\n=== CV Results (mean ± sd over", repeats, "random 80/20 splits) ===\n")
+print(summary_df)
+
+ggplot(res_df, aes(x = model, y = roc_auc)) +
+  geom_boxplot() +
+  theme_minimal() +
+  labs(title = "AUC across repeated 80/20 splits", x = NULL, y = "ROC AUC")
+
+
+```
